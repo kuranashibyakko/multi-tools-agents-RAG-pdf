@@ -1,0 +1,23 @@
+# Environment & Secrets
+.env
+*.env
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Local Vector Database & Sandbox scripts
+chroma_db/
+sandbox/temp_script.py
+sandbox/__pycache__/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Streamlit local config
+.streamlit/
+*.log
