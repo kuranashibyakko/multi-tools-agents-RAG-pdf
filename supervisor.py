@@ -40,16 +40,14 @@ SUPERVISOR_TOOLS_SCHEMA = [
         "function": {
             "name": "delegate_to_web_search",
             "description": (
-                "Search the live internet for nutrition or external facts. "
-                "Use clear, factual query phrases focusing on one or two items with keywords like 'nutrition facts' or 'grams sugar' "
-                "(e.g., 'Coca-Cola vs Pepsi sugar grams per 100ml nutrition facts')."
+                "Search the live internet for nutrition facts, benchmarks, or external knowledge."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "Specific search query.",
+                        "description": "Search query to look up.",
                     }
                 },
                 "required": ["task"],
@@ -61,14 +59,15 @@ SUPERVISOR_TOOLS_SCHEMA = [
         "function": {
             "name": "delegate_to_coder",
             "description": (
-                "Write and execute Python scripts in the sandbox for math, conversions, or simulations."
+                "Write and execute Python scripts in the sandbox for math, conversions, "
+                "simulations, or generating matplotlib charts/plots (saved as output_plot.png)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "Python task to execute.",
+                        "description": "Python calculation, simulation, or matplotlib chart task to execute.",
                     }
                 },
                 "required": ["task"],
@@ -92,10 +91,10 @@ SUPERVISOR_TOOLS_SCHEMA = [
                     },
                     "proposal": {
                         "type": "string",
-                        "description": "The draft solution, comparison table, or findings to verify.",
+                        "description": "The draft solution, summary statistics, or findings to verify.",
                     },
                 },
-                "required": ["task", "proposal"],
+                "required": ["task"],
             },
         },
     },
@@ -133,27 +132,28 @@ def call_groq_with_retry(messages, tools=None, max_retries=4):
     raise RuntimeError("Exceeded maximum retries for Groq API call.")
 
 
-def run_supervisor(user_request: str, max_iterations: int = 5, step_callback=None) -> str:
-    """Orchestrates the multi-agent network with rate-limit protection and context pruning."""
+def run_supervisor(user_request: str, max_iterations: int = 6, step_callback=None) -> str:
+    """Orchestrates the multi-agent network with rate-limit protection and clean fallback synthesis."""
     system_prompt = (
         "You are the Lead Supervisor of an autonomous multi-agent network.\n"
         "Workers:\n"
-        "1. Researcher: Searches local fruit juice paper in ChromaDB.\n"
-        "2. Web Search: Searches live internet for soda data.\n"
-        "3. Coder: Runs Python calculations.\n"
-        "4. Critic: Audits solutions.\n\n"
-        "EFFICIENCY & TOKEN MANAGEMENT RULES:\n"
-        "- Query the Researcher at most ONCE. If the paper lacks numeric values, accept that immediately.\n"
-        "- Query Web Search at most ONCE by batching all soda queries into a single call (e.g. 'sugar content per 100ml Coca-Cola Sprite').\n"
-        "- Combine the findings into the requested comparison table and call delegate_to_critic ONCE.\n"
-        "- Pass the original user request as 'task' to delegate_to_critic.\n"
-        "- When the Critic responds with PASSED, output the final synthesis immediately."
+        "1. Researcher ('delegate_to_researcher'): Searches local fruit juice paper in ChromaDB.\n"
+        "2. Web Search ('delegate_to_web_search'): Searches internet for external facts/nutrition data.\n"
+        "3. Coder ('delegate_to_coder'): Runs Python simulations and saves matplotlib plots to 'output_plot.png'.\n"
+        "4. Critic ('delegate_to_critic'): Audits solutions.\n\n"
+        "EXECUTION RULES:\n"
+        "- Call delegate_to_coder ONCE for a simulation or plot. If it returns '[Coder Worker: Execution Succeeded]' "
+        "and '[ARTIFACT CREATED]', do NOT re-run the Coder.\n"
+        "- Next, call delegate_to_critic ONCE with both 'task' (original request) and 'proposal' (the summary stats and confirmation that the plot was created).\n"
+        "- As soon as the Critic returns STATUS: PASSED, stop calling tools and output your final synthesis."
     )
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_request},
     ]
+
+    collected_observations = []
 
     print(f"\n=======================================================")
     print(f"[Supervisor Received Goal]: {user_request}")
@@ -165,14 +165,13 @@ def run_supervisor(user_request: str, max_iterations: int = 5, step_callback=Non
         try:
             response = call_groq_with_retry(messages, tools=SUPERVISOR_TOOLS_SCHEMA)
         except Exception as e:
-            err_msg = f"API Error: {str(e)}"
-            if step_callback:
-                step_callback("error", err_msg)
-            return err_msg
+            # If the model had a tool_use_failed formatting hiccup, fall back to synthesis
+            print(f"[Tool call formatting issue on cycle {iteration}, moving to synthesis: {e}]")
+            break
 
         response_message = response.choices[0].message
 
-        # Case A: Ready to synthesize
+        # Case A: Supervisor is done calling tools
         if not response_message.tool_calls:
             print("[Supervisor]: All worker tasks resolved. Final synthesis ready.\n")
             if step_callback:
@@ -191,12 +190,16 @@ def run_supervisor(user_request: str, max_iterations: int = 5, step_callback=Non
             try:
                 parsed_args = json.loads(raw_args)
             except json.JSONDecodeError:
-                parsed_args = {}
+                parsed_args = {"task": user_request}
+
+            # Guardrail: If model called critic without 'proposal', auto-fill from prior worker outputs
+            if worker_function == "delegate_to_critic" and not parsed_args.get("proposal"):
+                parsed_args["proposal"] = "\n\n".join(collected_observations) or "Completed task."
 
             if step_callback:
                 step_callback(
                     "dispatch",
-                    f"**Supervisor $\\rightarrow$ `{worker_function}`**\n```json\n{raw_args}\n```",
+                    f"**Supervisor $\\rightarrow$ `{worker_function}`**\n```json\n{json.dumps(parsed_args, indent=2)}\n```",
                 )
 
             if worker_function in SUPERVISOR_TOOLS_MAP:
@@ -212,10 +215,12 @@ def run_supervisor(user_request: str, max_iterations: int = 5, step_callback=Non
                     f"**Observation from `{worker_function}`:**\n{worker_result}",
                 )
 
-            # Context pruning: truncate stored tool observation to 600 chars to avoid TPM bloat
+            # Keep up to 1,500 chars so stdout and code are preserved without exceeding TPM
             pruned_result = str(worker_result)
-            if len(pruned_result) > 700:
-                pruned_result = pruned_result[:700] + "\n...[truncated for context limits]"
+            if len(pruned_result) > 1500:
+                pruned_result = pruned_result[:1500] + "\n...[truncated]"
+
+            collected_observations.append(f"[{worker_function}]:\n{pruned_result}")
 
             messages.append({
                 "role": "tool",
@@ -223,17 +228,28 @@ def run_supervisor(user_request: str, max_iterations: int = 5, step_callback=Non
                 "content": pruned_result,
             })
 
-    # Fallback synthesis if iterations finish
-    print("[Supervisor]: Synthesizing final answer from available context...")
-    messages.append({
-        "role": "user",
-        "content": "Please synthesize the complete final response now based on all worker observations.",
-    })
+    # Clean, tool-free fallback synthesis (prevents 400 tool_use_failed error)
+    print("[Supervisor]: Synthesizing final answer from collected worker observations...")
+    compiled_notes = "\n\n---\n\n".join(collected_observations)
+    synthesis_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the Lead Supervisor. Synthesize a complete, well-formatted final markdown report "
+                "answering the user's request based on the worker execution logs below."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"ORIGINAL REQUEST:\n{user_request}\n\nWORKER LOGS:\n{compiled_notes}",
+        },
+    ]
+
     try:
-        final_call = call_groq_with_retry(messages)
+        final_call = call_groq_with_retry(synthesis_messages, tools=None)
         final_answer = final_call.choices[0].message.content or "Completed analysis."
     except Exception as e:
-        final_answer = f"Completed analysis with available data: {str(e)}"
+        final_answer = f"Completed analysis:\n\n{compiled_notes}\n\n(Note: {str(e)})"
 
     if step_callback:
         step_callback("final", final_answer)
@@ -242,7 +258,7 @@ def run_supervisor(user_request: str, max_iterations: int = 5, step_callback=Non
 
 if __name__ == "__main__":
     print("==================================================")
-    print("Multi-Agent Supervisor Network Online")
+    print("Multi-Agent Supervisor Network Online (v2.0)")
     print("Active Personas: Supervisor, Researcher, Web Search, Coder, Critic")
     print("Type 'exit' or 'q' to shut down.")
     print("==================================================")

@@ -1,108 +1,97 @@
 import os
-from pathlib import Path
+import re
 import subprocess
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 from groq import Groq
 
-# 1. Environment & Setup
 load_dotenv()
-groq_client = Groq()
+groq_client = Groq(timeout=20.0)
 MODEL_NAME = "openai/gpt-oss-20b"
 
-# Dedicated directory for sandbox execution
 SANDBOX_DIR = Path("./sandbox").resolve()
 SANDBOX_DIR.mkdir(exist_ok=True)
 
 
-def execute_python_code(code: str, timeout_seconds: int = 10) -> dict:
-    """Executes Python code in an isolated subprocess inside the sandbox folder."""
-    script_path = SANDBOX_DIR / "temp_script.py"
-
-    with open(script_path, "w", encoding="utf-8") as f:
-        f.write(code)
-
-    try:
-        result = subprocess.run(
-            [sys.executable, str(script_path)],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=str(SANDBOX_DIR),
-        )
-
-        return {
-            "success": result.returncode == 0,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "return_code": result.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": f"Execution timed out after {timeout_seconds} seconds.",
-            "return_code": -1,
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "stdout": "",
-            "stderr": f"Subprocess runner failed: {str(e)}",
-            "return_code": -1,
-        }
+def extract_python_code(text: str) -> str:
+    """Extracts Python code from markdown code fences or raw response."""
+    pattern = r"```(?:python)?\s*(.*?)```"
+    matches = re.findall(pattern, text, re.DOTALL)
+    if matches:
+        return matches[0].strip()
+    return text.strip()
 
 
 def run_coder_worker(task: str) -> str:
-    """Coder persona: writes Python code for the task, runs it in the sandbox,
-    and returns the execution output to the supervisor.
+    """Coder Persona: Generates Python code, executes it in an isolated
+    subprocess sandbox, and supports headless matplotlib chart generation.
     """
     system_prompt = (
-        "You are an expert Python programming worker in a multi-agent network.\n"
-        "Your task is to write clean, complete, standalone Python code to accomplish the given goal.\n\n"
-        "Rules:\n"
-        "1. Output ONLY the raw executable Python code inside a single ```python ``` markdown block.\n"
-        "2. Ensure the code prints its final results to stdout using print().\n"
-        "3. Do not include interactive input() calls or external network requests.\n"
-        "4. Keep the code safe, robust, and self-contained."
+        "You are an expert Python Data Science & Simulation Engineer in a multi-agent network.\n"
+        "Write a standalone, self-contained Python script to solve the task.\n\n"
+        "STRICT RULES:\n"
+        "1. Output ONLY valid Python code inside a ```python ... ``` block.\n"
+        "2. Always print() numerical summary results clearly to stdout.\n"
+        "3. PLOTTING & CHARTS: If the task asks for a plot, histogram, chart, or visual comparison, "
+        "use `import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt` and "
+        "save the figure strictly as `'output_plot.png'` using "
+        "`plt.savefig('output_plot.png', dpi=150, bbox_inches='tight')`. Never call `plt.show()`.\n"
+        "4. Do not use external APIs or input() prompts."
     )
 
     response = groq_client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task},
+            {"role": "user", "content": f"Write and execute Python code for: {task}"},
         ],
         temperature=0.0,
     )
 
-    content = response.choices[0].message.content or ""
+    raw_output = response.choices[0].message.content or ""
+    clean_code = extract_python_code(raw_output)
 
-    # Extract code between fences
-    if "```python" in content:
-        code = content.split("```python")[1].split("```")[0].strip()
-    elif "```" in content:
-        code = content.split("```")[1].split("```")[0].strip()
-    else:
-        code = content.strip()
+    script_path = SANDBOX_DIR / "temp_script.py"
+    plot_path = SANDBOX_DIR / "output_plot.png"
 
-    run_result = execute_python_code(code)
+    if plot_path.exists():
+        plot_path.unlink()
 
-    if run_result["success"]:
-        return (
-            f"[Coder Worker: Execution Succeeded]\n"
-            f"Code Executed:\n```python\n{code}\n```\n"
-            f"Output (stdout):\n{run_result['stdout'] or '(No stdout produced)'}"
-        )
-    else:
-        return (
-            f"[Coder Worker: Execution Failed]\n"
-            f"Code Attempted:\n```python\n{code}\n```\n"
-            f"Error (stderr):\n{run_result['stderr']}"
+    script_path.write_text(clean_code, encoding="utf-8")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            cwd=str(SANDBOX_DIR),
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
 
+        stdout_str = result.stdout.strip() or "(No stdout printed)"
+        stderr_str = result.stderr.strip()
 
-if __name__ == "__main__":
-    print("Testing Coder Worker directly...")
-    res = run_coder_worker("Print the sum of squares from 1 to 10")
-    print(res)
+        if result.returncode == 0:
+            plot_notice = ""
+            if plot_path.exists():
+                plot_notice = "[ARTIFACT CREATED]: Chart saved to sandbox/output_plot.png\n"
+
+            # Put stdout and artifact confirmation FIRST so they are never truncated
+            return (
+                f"[Coder Worker: Execution Succeeded]\n"
+                f"{plot_notice}"
+                f"Standard Output:\n```\n{stdout_str}\n```\n"
+                f"Code Executed:\n```python\n{clean_code}\n```"
+            )
+        else:
+            return (
+                f"[Coder Worker: Execution Failed (Exit Code {result.returncode})]\n"
+                f"Error Traceback:\n```\n{stderr_str}\n```\n"
+                f"Code Attempted:\n```python\n{clean_code}\n```"
+            )
+
+    except subprocess.TimeoutExpired:
+        return "[Coder Worker: Execution Failed] Script timed out after 15 seconds."
+    except Exception as e:
+        return f"[Coder Worker: Execution Error] {str(e)}"
