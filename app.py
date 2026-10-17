@@ -3,17 +3,23 @@ import time
 from pathlib import Path
 import streamlit as st
 
-from ingest import collection, get_indexed_sources, index_pdf_file
+from ingest import (
+    collection,
+    delete_document_by_source,
+    get_indexed_sources,
+    index_pdf_file,
+)
 from supervisor import run_supervisor
+from telemetry import get_telemetry_summary, log_agent_run
 
 st.set_page_config(
-    page_title="Multi-Agent Supervisor Studio v2.0",
+    page_title="Multi-Agent Supervisor Studio v3.0",
     page_icon="🤖",
     layout="wide",
 )
 
-st.title("🤖 Multi-Agent Supervisor-Worker Network (v2.0)")
-st.caption("Hierarchical Swarm with Dynamic RAG, Web Search, Visual Code Sandbox & Critic QA")
+st.title("🤖 Multi-Agent Supervisor-Worker Network (v3.0)")
+st.caption("Parallel Swarm Execution • Multi-Turn Memory • Visual Sandbox • SQLite Telemetry")
 
 DOCS_DIR = Path("./docs").resolve()
 DOCS_DIR.mkdir(exist_ok=True)
@@ -21,14 +27,12 @@ SANDBOX_DIR = Path("./sandbox").resolve()
 SANDBOX_DIR.mkdir(exist_ok=True)
 
 # =====================================================================
-# SIDEBAR: DOCUMENT RE-INDEXING & SWARM TELEMETRY
+# SIDEBAR: DOCUMENT KNOWLEDGE BASE & MANAGEMENT
 # =====================================================================
 with st.sidebar:
     st.header("📚 Document Knowledge Base")
-    st.caption("Upload PDFs to dynamically index them into ChromaDB for the Researcher.")
-
     uploaded_files = st.file_uploader(
-        "Choose PDF document(s)",
+        "Upload PDF(s) to ChromaDB",
         type=["pdf"],
         accept_multiple_files=True,
     )
@@ -40,16 +44,13 @@ with st.sidebar:
                 with open(save_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
 
-                with st.spinner(f"Chunking & embedding `{uploaded_file.name}`..."):
+                with st.spinner(f"Embedding `{uploaded_file.name}`..."):
                     result = index_pdf_file(save_path)
 
                 if result["success"]:
-                    st.success(
-                        f"**{uploaded_file.name}**: Indexed {result['chunks']} chunks! "
-                        f"(Total DB: {result['total']})"
-                    )
+                    st.success(f"Indexed {result['chunks']} chunks from `{uploaded_file.name}`")
                 else:
-                    st.error(f"Failed to index {uploaded_file.name}: {result['error']}")
+                    st.error(f"Failed: {result['error']}")
 
     st.divider()
 
@@ -57,114 +58,139 @@ with st.sidebar:
     st.subheader(f"Indexed Documents ({len(indexed_sources)})")
     if indexed_sources:
         for src in indexed_sources:
-            st.markdown(f"- 📄 `{src}`")
-        st.caption(f"Total vector chunks in ChromaDB: **{collection.count()}**")
+            col1, col2 = st.columns([4, 1])
+            col1.markdown(f"📄 `{src}`")
+            if col2.button("✖", key=f"del_{src}", help=f"Remove {src} from ChromaDB"):
+                deleted_count = delete_document_by_source(src)
+                st.toast(f"Removed {deleted_count} chunks for {src}")
+                st.rerun()
+        st.caption(f"Total vector chunks: **{collection.count()}**")
     else:
-        st.info("No documents currently indexed.")
+        st.info("No documents indexed.")
 
     st.divider()
-
-    st.header("Active Agent Swarm")
-    st.markdown("""
-    - 👑 **Supervisor:** Orchestration & Step Planning
-    - 📚 **Researcher:** ChromaDB Vector Retrieval (`all-MiniLM-L6-v2`)
-    - 🌐 **Web Search:** DuckDuckGo Real-Time Search (`ddgs`)
-    - 📊 **Coder (v2.0):** Python & Matplotlib Visual Sandbox
-    - 🛡️ **Critic:** Adversarial QA & Self-Healing Verifier
-    """)
-    if st.button("🗑️ Clear Chat History", use_container_width=True):
+    if st.button("🗑️ Clear Chat Memory", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
-
 # =====================================================================
-# CHAT SESSION & VISUAL ARTIFACT RENDERING
+# MAIN WORKSPACE TABS
 # =====================================================================
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+tab_chat, tab_telemetry = st.tabs(["💬 Agent Workspace", "📊 System Telemetry & Audit Logs"])
 
-for idx, msg in enumerate(st.session_state.messages):
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg.get("plot_path") and Path(msg["plot_path"]).exists():
-            st.image(msg["plot_path"], caption="Generated Sandbox Visualization", use_container_width=True)
-            with open(msg["plot_path"], "rb") as img_file:
-                st.download_button(
-                    label="📥 Download Chart (PNG)",
-                    data=img_file,
-                    file_name=Path(msg["plot_path"]).name,
-                    mime="image/png",
-                    key=f"dl_{idx}",
-                )
-        if msg.get("telemetry"):
-            st.caption(msg["telemetry"])
+with tab_chat:
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-user_prompt = st.chat_input("Ask a question, run a simulation, or request a data visualization...")
+    for idx, msg in enumerate(st.session_state.messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg.get("plot_path") and Path(msg["plot_path"]).exists():
+                st.image(msg["plot_path"], caption="Generated Sandbox Visualization", use_container_width=True)
+                with open(msg["plot_path"], "rb") as img_file:
+                    st.download_button(
+                        label="📥 Download Chart (PNG)",
+                        data=img_file,
+                        file_name=Path(msg["plot_path"]).name,
+                        mime="image/png",
+                        key=f"dl_{idx}",
+                    )
+            if msg.get("telemetry"):
+                st.caption(msg["telemetry"])
 
-if user_prompt:
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
+    user_prompt = st.chat_input("Ask a question, follow up on a previous turn, or plot data...")
 
-    with st.chat_message("assistant"):
-        status_box = st.status("🚀 Supervisor assembling worker swarm...", expanded=True)
-        start_time = time.time()
-        metrics = {"dispatches": 0}
+    if user_prompt:
+        prior_history = list(st.session_state.messages)
+        st.session_state.messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
 
-        # Clear any lingering plot before starting a new turn
-        active_plot = SANDBOX_DIR / "output_plot.png"
-        if active_plot.exists():
-            active_plot.unlink()
+        with st.chat_message("assistant"):
+            status_box = st.status("🚀 Supervisor orchestrating worker swarm...", expanded=True)
+            start_time = time.time()
+            metrics = {"dispatches": 0}
 
-        def visual_callback(event_type: str, data: str):
-            if event_type == "dispatch":
-                metrics["dispatches"] += 1
-                status_box.write(f"🔄 {data}")
-            elif event_type == "observation":
-                with status_box.expander("📋 Inspect Worker Output", expanded=False):
-                    st.markdown(data)
-            elif event_type == "final":
-                status_box.update(
-                    label="✅ All Worker Tasks Verified and Complete!",
-                    state="complete",
-                    expanded=False,
-                )
+            active_plot = SANDBOX_DIR / "output_plot.png"
+            if active_plot.exists():
+                active_plot.unlink()
 
-        final_result = run_supervisor(
-            user_prompt, max_iterations=6, step_callback=visual_callback
-        )
-        elapsed = time.time() - start_time
+            def visual_callback(event_type: str, data: str):
+                if event_type == "dispatch":
+                    metrics["dispatches"] += 1
+                    status_box.write(f"🔄 {data}")
+                elif event_type == "observation":
+                    with status_box.expander("📋 Inspect Worker Output", expanded=False):
+                        st.markdown(data)
+                elif event_type == "final":
+                    status_box.update(
+                        label="✅ All Worker Tasks Verified and Complete!",
+                        state="complete",
+                        expanded=False,
+                    )
 
-        st.markdown(final_result)
+            final_result = run_supervisor(
+                user_prompt,
+                max_iterations=6,
+                step_callback=visual_callback,
+                chat_history=prior_history,
+            )
+            elapsed = time.time() - start_time
 
-        # Check if the Coder generated a matplotlib plot during this run
-        saved_plot_path = None
-        if active_plot.exists():
-            timestamp_name = f"chart_{int(time.time())}.png"
-            archived_plot = SANDBOX_DIR / timestamp_name
-            shutil.copy(active_plot, archived_plot)
-            saved_plot_path = str(archived_plot)
+            st.markdown(final_result)
 
-            st.image(saved_plot_path, caption="Generated Sandbox Visualization", use_container_width=True)
-            with open(saved_plot_path, "rb") as img_file:
-                st.download_button(
-                    label="📥 Download Chart (PNG)",
-                    data=img_file,
-                    file_name=timestamp_name,
-                    mime="image/png",
-                    key=f"dl_live_{int(time.time())}",
-                )
+            saved_plot_path = None
+            if active_plot.exists():
+                timestamp_name = f"chart_{int(time.time())}.png"
+                archived_plot = SANDBOX_DIR / timestamp_name
+                shutil.copy(active_plot, archived_plot)
+                saved_plot_path = str(archived_plot)
 
-        telemetry_str = (
-            f"⏱️ **Execution Time:** {elapsed:.2f}s | "
-            f"🔄 **Worker Dispatches:** {metrics['dispatches']} | "
-            f"🧠 **Model:** `openai/gpt-oss-20b`"
-        )
-        st.caption(telemetry_str)
+                st.image(saved_plot_path, caption="Generated Sandbox Visualization", use_container_width=True)
+                with open(saved_plot_path, "rb") as img_file:
+                    st.download_button(
+                        label="📥 Download Chart (PNG)",
+                        data=img_file,
+                        file_name=timestamp_name,
+                        mime="image/png",
+                        key=f"dl_live_{int(time.time())}",
+                    )
 
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": final_result,
-        "plot_path": saved_plot_path,
-        "telemetry": telemetry_str,
-    })
+            log_agent_run(
+                prompt=user_prompt,
+                dispatches=metrics["dispatches"],
+                latency_sec=elapsed,
+                chart_generated=bool(saved_plot_path),
+            )
+
+            telemetry_str = (
+                f"⏱️ **Execution Time:** {elapsed:.2f}s | "
+                f"🔄 **Worker Dispatches:** {metrics['dispatches']} | "
+                f"🧠 **Context Turns:** {len(prior_history) // 2} | "
+                f"⚡ **Model:** `openai/gpt-oss-20b`"
+            )
+            st.caption(telemetry_str)
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": final_result,
+            "plot_path": saved_plot_path,
+            "telemetry": telemetry_str,
+        })
+
+with tab_telemetry:
+    st.subheader("📈 Historical Swarm Performance (SQLite)")
+    summary = get_telemetry_summary()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Runs Logged", summary["total_runs"])
+    c2.metric("Avg Latency (s)", f"{summary['avg_latency']}s")
+    c3.metric("Avg Worker Dispatches", summary["avg_dispatches"])
+    c4.metric("Visual Charts Generated", summary["total_charts"])
+
+    st.divider()
+    st.markdown("#### Recent Execution Traces")
+    if summary["recent_runs"]:
+        st.dataframe(summary["recent_runs"], use_container_width=True)
+    else:
+        st.info("No runs recorded yet. Submit a prompt in the Agent Workspace tab!")

@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -20,8 +21,8 @@ SUPERVISOR_TOOLS_SCHEMA = [
         "function": {
             "name": "delegate_to_researcher",
             "description": (
-                "Search the local fruit juice PDF in ChromaDB. "
-                "Use once for questions about the study's experimental juice findings."
+                "Search the local indexed PDF documents in ChromaDB. "
+                "Use once for questions about local study experiments or uploaded papers."
             ),
             "parameters": {
                 "type": "object",
@@ -132,69 +133,72 @@ def call_groq_with_retry(messages, tools=None, max_retries=4):
     raise RuntimeError("Exceeded maximum retries for Groq API call.")
 
 
-def run_supervisor(user_request: str, max_iterations: int = 6, step_callback=None) -> str:
-    """Orchestrates the multi-agent network with rate-limit protection and clean fallback synthesis."""
+def run_supervisor(
+    user_request: str,
+    max_iterations: int = 6,
+    step_callback=None,
+    chat_history: list | None = None,
+) -> str:
+    """Orchestrates the multi-agent network with sliding-window memory and parallel tool dispatch."""
     system_prompt = (
         "You are the Lead Supervisor of an autonomous multi-agent network.\n"
         "Workers:\n"
-        "1. Researcher ('delegate_to_researcher'): Searches local fruit juice paper in ChromaDB.\n"
+        "1. Researcher ('delegate_to_researcher'): Searches local PDFs in ChromaDB.\n"
         "2. Web Search ('delegate_to_web_search'): Searches internet for external facts/nutrition data.\n"
         "3. Coder ('delegate_to_coder'): Runs Python simulations and saves matplotlib plots to 'output_plot.png'.\n"
         "4. Critic ('delegate_to_critic'): Audits solutions.\n\n"
         "EXECUTION RULES:\n"
+        "- You can emit multiple tool calls simultaneously (e.g., Researcher + Web Search) when tasks are independent.\n"
         "- Call delegate_to_coder ONCE for a simulation or plot. If it returns '[Coder Worker: Execution Succeeded]' "
         "and '[ARTIFACT CREATED]', do NOT re-run the Coder.\n"
         "- Next, call delegate_to_critic ONCE with both 'task' (original request) and 'proposal' (the summary stats and confirmation that the plot was created).\n"
         "- As soon as the Critic returns STATUS: PASSED, stop calling tools and output your final synthesis."
     )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_request},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Inject sliding-window memory (last 4 messages, pruned to 400 chars each to protect TPM)
+    if chat_history:
+        for past_msg in chat_history[-4:]:
+            role = past_msg.get("role", "user")
+            content = str(past_msg.get("content", ""))[:400]
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": user_request})
 
     collected_observations = []
 
-    print(f"\n=======================================================")
-    print(f"[Supervisor Received Goal]: {user_request}")
-    print(f"=======================================================\n")
-
     for iteration in range(1, max_iterations + 1):
-        print(f"--- [Supervisor Cycle {iteration}] ---")
-
         try:
             response = call_groq_with_retry(messages, tools=SUPERVISOR_TOOLS_SCHEMA)
         except Exception as e:
-            # If the model had a tool_use_failed formatting hiccup, fall back to synthesis
-            print(f"[Tool call formatting issue on cycle {iteration}, moving to synthesis: {e}]")
+            print(f"[Tool formatting fallback on cycle {iteration}: {e}]")
             break
 
         response_message = response.choices[0].message
 
-        # Case A: Supervisor is done calling tools
         if not response_message.tool_calls:
-            print("[Supervisor]: All worker tasks resolved. Final synthesis ready.\n")
             if step_callback:
                 step_callback("final", response_message.content)
             return response_message.content
 
-        # Case B: Tool Dispatch
         messages.append(response_message)
 
+        # Prepare tool calls for execution
+        parsed_calls = []
         for tool_call in response_message.tool_calls:
             worker_function = tool_call.function.name
             raw_args = tool_call.function.arguments
-
-            print(f"[Supervisor -> {worker_function}]: {raw_args}")
-
             try:
                 parsed_args = json.loads(raw_args)
             except json.JSONDecodeError:
                 parsed_args = {"task": user_request}
 
-            # Guardrail: If model called critic without 'proposal', auto-fill from prior worker outputs
             if worker_function == "delegate_to_critic" and not parsed_args.get("proposal"):
                 parsed_args["proposal"] = "\n\n".join(collected_observations) or "Completed task."
+
+            parsed_calls.append((tool_call.id, worker_function, parsed_args))
 
             if step_callback:
                 step_callback(
@@ -202,20 +206,25 @@ def run_supervisor(user_request: str, max_iterations: int = 6, step_callback=Non
                     f"**Supervisor $\\rightarrow$ `{worker_function}`**\n```json\n{json.dumps(parsed_args, indent=2)}\n```",
                 )
 
-            if worker_function in SUPERVISOR_TOOLS_MAP:
-                worker_result = SUPERVISOR_TOOLS_MAP[worker_function](**parsed_args)
+        # Execute tool calls concurrently using ThreadPoolExecutor
+        def execute_single_tool(call_tuple):
+            call_id, func_name, kwargs = call_tuple
+            if func_name in SUPERVISOR_TOOLS_MAP:
+                res = SUPERVISOR_TOOLS_MAP[func_name](**kwargs)
             else:
-                worker_result = f"Error: Worker '{worker_function}' is not registered."
+                res = f"Error: Worker '{func_name}' is not registered."
+            return call_id, func_name, res
 
-            print(f"[Worker Response]: {str(worker_result)[:140]}...\n")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(execute_single_tool, parsed_calls))
 
+        for call_id, worker_function, worker_result in results:
             if step_callback:
                 step_callback(
                     "observation",
                     f"**Observation from `{worker_function}`:**\n{worker_result}",
                 )
 
-            # Keep up to 1,500 chars so stdout and code are preserved without exceeding TPM
             pruned_result = str(worker_result)
             if len(pruned_result) > 1500:
                 pruned_result = pruned_result[:1500] + "\n...[truncated]"
@@ -224,12 +233,11 @@ def run_supervisor(user_request: str, max_iterations: int = 6, step_callback=Non
 
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call.id,
+                "tool_call_id": call_id,
                 "content": pruned_result,
             })
 
-    # Clean, tool-free fallback synthesis (prevents 400 tool_use_failed error)
-    print("[Supervisor]: Synthesizing final answer from collected worker observations...")
+    # Clean, tool-free fallback synthesis
     compiled_notes = "\n\n---\n\n".join(collected_observations)
     synthesis_messages = [
         {
@@ -254,19 +262,3 @@ def run_supervisor(user_request: str, max_iterations: int = 6, step_callback=Non
     if step_callback:
         step_callback("final", final_answer)
     return final_answer
-
-
-if __name__ == "__main__":
-    print("==================================================")
-    print("Multi-Agent Supervisor Network Online (v2.0)")
-    print("Active Personas: Supervisor, Researcher, Web Search, Coder, Critic")
-    print("Type 'exit' or 'q' to shut down.")
-    print("==================================================")
-
-    while True:
-        user_input = input("\nEnter Request: ").strip()
-        if user_input.lower() in ("exit", "q"):
-            break
-        if not user_input:
-            continue
-        print(f"\nFINAL SYNTHESIS:\n{run_supervisor(user_input)}\n")

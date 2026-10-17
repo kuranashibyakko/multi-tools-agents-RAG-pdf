@@ -91,6 +91,17 @@ def get_indexed_sources() -> list[str]:
     except Exception:
         return []
 
+def delete_document_by_source(source_name: str) -> int:
+    """Deletes all vector chunks belonging to a specific PDF filename."""
+    try:
+        existing = collection.get(where={"source": source_name})
+        ids_to_delete = existing.get("ids", [])
+        if ids_to_delete:
+            collection.delete(ids=ids_to_delete)
+        return len(ids_to_delete)
+    except Exception:
+        return 0
+
 
 if __name__ == "__main__":
     default_pdf = DOCS_DIR / "Fruit_Juice_Sugar_Content_Transcription_AI.pdf"
